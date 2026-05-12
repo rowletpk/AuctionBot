@@ -45,7 +45,7 @@ Golbat,
 Oddish,Sprouting Oddish
 Gloom,
 Vileplume,
-Paras,Flower Paras
+Paras,"Flower Paras, Mycena Paras"
 Parasect,
 Venonat,
 Venomoth,
@@ -68,7 +68,7 @@ Alakazam,Mega Alakazam
 Machop,
 Machoke,
 Machamp,Gigantamax Machamp
-Bellsprout,
+Bellsprout,Beta Bellsprout
 Weepinbell,
 Victreebel,
 Tentacool,
@@ -152,7 +152,7 @@ Dragonite,"Conductor Dragonite, Guardian Dragonite"
 Mewtwo,"Mega Mewtwo X, Mega Mewtwo Y, Shadow Mewtwo"
 Mew,"Lights Mew, Pride Mew"
 Chikorita,Autumn Chikorita
-Bayleef,
+Bayleef,Beta Bayleef
 Meganium,Shamrock Meganium
 Cyndaquil,Spikey Cyndaquil
 Quilava,
@@ -164,7 +164,7 @@ Sentret,Archery Sentret
 Furret,
 Hoothoot,
 Noctowl,
-Ledyba,
+Ledyba,Swarming Ledyba
 Ledian,Harvesting Ledian
 Spinarak,
 Ariados,
@@ -188,7 +188,7 @@ Sudowoodo,Festive Sudowoodo
 Politoed,
 Hoppip,
 Skiploom,
-Jumpluff,
+Jumpluff,Dandelion Jumpluff
 Aipom,
 Sunkern,
 Sunflora,Anniversary Sunflora
@@ -405,7 +405,7 @@ Kricketune,Wizard Kricketune
 Shinx,
 Luxio,
 Luxray,
-Budew,
+Budew,Blooming Budew
 Roserade,Pride Roserade
 Cranidos,
 Rampardos,
@@ -547,7 +547,7 @@ Whirlipede,
 Scolipede,
 Cottonee,Cherry Blossom Cottonee
 Whimsicott,
-Petilil,
+Petilil,Onion Petilil
 Lilligant,"Hisuian Lilligant, Poinsettia Lilligant, La Catrina Hisuian Lilligant"
 Basculin,"Blue-Striped Basculin, White-Striped Basculin"
 Sandile,
@@ -737,7 +737,7 @@ Yungoos,
 Gumshoos,
 Grubbin,
 Charjabug,Camper Charjabug
-Vikavolt,
+Vikavolt,Cicada Vikavolt
 Crabrawler,
 Crabominable,
 Oricorio,"Pa'u Oricorio, Pom-pom Oricorio, Sensu Oricorio, Cheerleader Oricorio"
@@ -1018,7 +1018,7 @@ Munkidori,
 Fezandipiti,
 Ogerpon,"Cornerstone Mask Ogerpon, Hearthflame Mask Ogerpon, Wellspring Mask Ogerpon"
 Archaludon,
-Hydrapple,
+Hydrapple,Blossom Hydrapple
 Gouging Fire,
 Raging Bolt,
 Iron Boulder,
