@@ -446,13 +446,13 @@ def _analyse(
                 accent_colour=discord.Colour(0xf04747),
             )
             def __init__(self):
-                super().__init__(timeout=None)
+                super().__init__(timeout=300)
         return PriceViewWithOutliers(), outlier_buf
     else:
         class PriceView(discord.ui.LayoutView):
             container = discord.ui.Container(*main_comps, accent_colour=accent)
             def __init__(self):
-                super().__init__(timeout=None)
+                super().__init__(timeout=300)
         return PriceView(), None
 
 
