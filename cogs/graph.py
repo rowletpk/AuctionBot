@@ -26,7 +26,7 @@ from pymongo import MongoClient
 import config
 from config import REPLY
 from utils import build_query, resolve_pokemon_name, shiny_prefix
-from filters import FLAG_DEFINITIONS, all_flags_help
+from filters import FLAG_DEFINITIONS
 
 # ─── DB ───────────────────────────────────────────────────────────────────────
 _mongo = MongoClient(config.MONGO_URI)
@@ -533,15 +533,8 @@ class Graph(commands.Cog):
         file = discord.File(buf, filename="graph.png")
         ref  = ctx.message if not (hasattr(ctx, "interaction") and ctx.interaction) else None
 
-        # Build filter reference lines dynamically from filters.py so they stay in sync
-        _filter_lines: list[str] = []
-        for _f in all_flags_help():
-            _arg_s   = " <value>" if _f["takes_arg"] else ""
-            _aliases = ", ".join(_f["aliases"][:3]) if _f.get("aliases") else ""
-            _alias_s = f"  _({_aliases})_" if _aliases else ""
-            _filter_lines.append(f"{REPLY} `{_f['flag']}{_arg_s}` — {_f['help']}{_alias_s}")
-
-        legend_text = (
+        # ── Static text payloads for button ephemeral replies ─────────────────
+        _legend_text = (
             f"**📖 Reading the Graph**\n"
             f"{REPLY} **Dots** — every individual auction sale, plotted by date and price\n"
             f"{REPLY} **Avg Line** — smoothed average price over time; shows the general price direction\n"
@@ -555,74 +548,132 @@ class Graph(commands.Cog):
             f"{REPLY} **Median** — middle price (less affected by extreme outliers than avg)\n"
             f"{REPLY} **Std Dev** — how spread out prices are; high = big price swings, low = consistent\n"
             f"{REPLY} **Trend** — average price change per sale (▲ rising, ▼ falling)\n"
-            f"{REPLY} **Outliers** — sales so far above the typical price range that they would squash all other data on the chart. Excluded from the graph and most stats, but listed separately below\n"
-            f"{REPLY} **Chart Max** — highest sale visible on the graph (outliers excluded); what the market realistically peaks at\n"
-            f"{REPLY} **All-time Max** — the absolute highest sale ever recorded, including outliers\n\n"
-            f"**🔍 Available Filters**\n"
-            f"-# Use these with `j!g` — e.g. `j!g --name pikachu --shiny --iv >90`\n"
-            + "\n".join(_filter_lines)
+            f"{REPLY} **Outliers** — sales so far above the typical price range they squash everything else. Excluded from the graph and most stats\n"
+            f"{REPLY} **Chart Max** — highest sale visible on the graph (outliers excluded)\n"
+            f"{REPLY} **All-time Max** — the absolute highest sale ever recorded, including outliers"
         )
 
+        _filters_text = (
+            f"**🔍 Available Filters**\n"
+            f"-# Use these with `j!g` — e.g. `j!g --name pikachu --shiny --iv >90`\n"
+            f"{REPLY} `--name <value>` — Pokémon name  _(--n, -n, --pokemon)_\n"
+            f"{REPLY} `--shiny` — Shiny only  _(--sh)_\n"
+            f"{REPLY} `--gmax` — Gigantamax only  _(--gm, --giga)_\n"
+            f"{REPLY} `--noshiny` — Exclude shinies  _(--nosh)_\n"
+            f"{REPLY} `--nogmax` — Exclude Gigantamax  _(--nogm)_\n"
+            f"{REPLY} `--iv <value>` — Total IV % e.g. `>90`, `>=85`, `90-100`  _(--totaliv)_\n"
+            f"{REPLY} `--hpiv / --atkiv / --defiv / --spatkiv / --spdefiv / --spdiv <value>` — Individual IVs\n"
+            f"{REPLY} `--level <value>` — Level e.g. `50`, `>50`, `30-100`  _(--lv, --lvl)_\n"
+            f"{REPLY} `--nature <value>` — Nature e.g. `adamant`  _(--nat)_\n"
+            f"{REPLY} `--move <value>` — Has this move, stackable  _(-m, --moves)_\n"
+            f"{REPLY} `--gender <value>` — `male`, `female`, or `unknown`  _(--g)_\n"
+            f"{REPLY} `--type <value>` — Type, stackable up to 2  _(--t)_\n"
+            f"{REPLY} `--region <value>` — Region e.g. `kanto`, `galar`  _(--r)_\n"
+            f"{REPLY} `--evo <value>` — Entire evo family  _(--family)_\n"
+            f"{REPLY} `--category <value>` — Category e.g. `rares`, `starters`  _(--cat)_\n"
+            f"{REPLY} `--exclude <value>` — Exclude by name/type/region/category  _(--ex)_\n"
+            f"{REPLY} `--price <value>` — Price filter e.g. `>5000`, `500-5000`  _(--p, --bid)_\n"
+            f"{REPLY} `--limit <value>` — Limit to N most recent matches  _(--lim, --top)_\n"
+            f"{REPLY} `--sort <value>` — Sort by `iv`, `bid`, `level`, `date`, `id` (append `+`/`-`)  _(--order)_"
+        )
+
+        # ── Build outlier BytesIO if needed — used only by the button callback ─
+        out_buf = None
         if outliers:
-            out_buf  = build_outlier_image(outliers, name, variant)
-            out_file = discord.File(out_buf, filename="outliers.png")
+            out_buf = build_outlier_image(outliers, name, variant)
 
-            class CombinedView(discord.ui.LayoutView):
-                container1 = discord.ui.Container(
-                    discord.ui.TextDisplay(content=heading),
-                    discord.ui.TextDisplay(content=sub),
-                    discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
-                    discord.ui.MediaGallery(
-                        discord.MediaGalleryItem(media="attachment://graph.png"),
-                    ),
-                    discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
-                    discord.ui.TextDisplay(content=legend_text),
-                    accent_colour=accent,
-                )
-                container2 = discord.ui.Container(
-                    discord.ui.TextDisplay(
-                        content=(
-                            f"⚠️ **{len(outliers)} outlier sale(s) excluded from the graph**\n"
-                            f"_These sales were far above typical prices and excluded to keep the Y-axis readable._"
-                        )
-                    ),
-                    discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
-                    discord.ui.MediaGallery(
-                        discord.MediaGalleryItem(media="attachment://outliers.png"),
-                    ),
-                    accent_colour=discord.Colour(0xf04747),
-                )
+        # ── Main view — graph + filters + buttons ─────────────────────────────
+        _outlier_count  = len(outliers)
+        _has_outliers   = bool(outliers)
+        _legend_capture = _legend_text   # close over for button callbacks
+
+        # Re-generate outlier image bytes for the button callback (the File above
+        # is consumed by the initial send, so we keep the raw BytesIO separately)
+        _outlier_bytes = out_buf  # BytesIO | None  (already seeked to 0)
+
+        class GraphView(discord.ui.LayoutView):
+            # ── How to read button ─────────────────────────────────────────────
+            class HowToReadBtn(discord.ui.Button):
                 def __init__(self):
-                    super().__init__(timeout=300)
+                    super().__init__(
+                        style=discord.ButtonStyle.secondary,
+                        label="📖 How to read",
+                        custom_id="g_legend",
+                    )
+                async def callback(self, interaction: discord.Interaction):
+                    class LegendView(discord.ui.LayoutView):
+                        c = discord.ui.Container(
+                            discord.ui.TextDisplay(content=_legend_capture),
+                            accent_colour=config.EMBED_COLOR,
+                        )
+                    await interaction.response.send_message(
+                        view=LegendView(),
+                        ephemeral=True,
+                    )
 
-            await ctx.send(
-                view=CombinedView(),
-                files=[file, out_file],
-                reference=ref,
-                mention_author=False,
+            container = discord.ui.Container(
+                discord.ui.TextDisplay(content=heading),
+                discord.ui.TextDisplay(content=sub),
+                discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+                discord.ui.MediaGallery(
+                    discord.MediaGalleryItem(media="attachment://graph.png"),
+                ),
+                discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+                discord.ui.TextDisplay(content=_filters_text),
+                accent_colour=accent,
+            )
+
+            def __init__(self):
+                super().__init__(timeout=300)
+
+        # Dynamically add the outliers button only when there are outliers.
+        # We patch it onto the action row after class definition so the button
+        # is only present when relevant.
+        if _has_outliers:
+            _outlier_bytes.seek(0)  # reset for the callback closure
+
+            class OutliersBtn(discord.ui.Button):
+                def __init__(self):
+                    super().__init__(
+                        style=discord.ButtonStyle.danger,
+                        label=f"⚠️ {_outlier_count} outlier(s)",
+                        custom_id="g_outliers",
+                    )
+                async def callback(self, interaction: discord.Interaction):
+                    _outlier_bytes.seek(0)
+                    out_f = discord.File(_outlier_bytes, filename="outliers.png")
+                    class OutlierView(discord.ui.LayoutView):
+                        c = discord.ui.Container(
+                            discord.ui.TextDisplay(content=(
+                                f"⚠️ **{_outlier_count} outlier sale(s) excluded from the graph**\n"
+                                f"_Sales far above typical prices — excluded to keep the Y-axis readable._"
+                            )),
+                            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+                            discord.ui.MediaGallery(
+                                discord.MediaGalleryItem(media="attachment://outliers.png"),
+                            ),
+                            accent_colour=discord.Colour(0xf04747),
+                        )
+                    await interaction.response.send_message(
+                        view=OutlierView(),
+                        file=out_f,
+                        ephemeral=True,
+                    )
+
+            GraphView.action_row = discord.ui.ActionRow(
+                GraphView.HowToReadBtn(), OutliersBtn()
             )
         else:
-            class GraphView(discord.ui.LayoutView):
-                container1 = discord.ui.Container(
-                    discord.ui.TextDisplay(content=heading),
-                    discord.ui.TextDisplay(content=sub),
-                    discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
-                    discord.ui.MediaGallery(
-                        discord.MediaGalleryItem(media="attachment://graph.png"),
-                    ),
-                    discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
-                    discord.ui.TextDisplay(content=legend_text),
-                    accent_colour=accent,
-                )
-                def __init__(self):
-                    super().__init__(timeout=300)
-
-            await ctx.send(
-                view=GraphView(),
-                file=file,
-                reference=ref,
-                mention_author=False,
+            GraphView.action_row = discord.ui.ActionRow(
+                GraphView.HowToReadBtn()
             )
+
+        await ctx.send(
+            view=GraphView(),
+            file=file,
+            reference=ref,
+            mention_author=False,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
