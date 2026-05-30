@@ -574,7 +574,10 @@ class Graph(commands.Cog):
             f"{REPLY} `--exclude <value>` — Exclude by name/type/region/category  _(--ex)_\n"
             f"{REPLY} `--price <value>` — Price filter e.g. `>5000`, `500-5000`  _(--p, --bid)_\n"
             f"{REPLY} `--limit <value>` — Limit to N most recent matches  _(--lim, --top)_\n"
-            f"{REPLY} `--sort <value>` — Sort by `iv`, `bid`, `level`, `date`, `id` (append `+`/`-`)  _(--order)_"
+            f"{REPLY} `--sort <value>` — Sort by `iv`, `bid`, `level`, `date`, `id` (append `+`/`-`)  _(--order)_\n\n"
+            f"-# 💡 **Pro tip:** Use `--limit` to focus on the most recent auctions of a Pokémon — "
+            f"e.g. `j!g --name garchomp --limit 50` graphs only the latest 50 sales, "
+            f"giving you a much cleaner picture of where prices stand today."
         )
 
         # ── Build outlier BytesIO if needed — used only by the button callback ─
@@ -591,48 +594,39 @@ class Graph(commands.Cog):
         # is consumed by the initial send, so we keep the raw BytesIO separately)
         _outlier_bytes = out_buf  # BytesIO | None  (already seeked to 0)
 
-        class GraphView(discord.ui.LayoutView):
-            # ── How to read button ─────────────────────────────────────────────
-            class HowToReadBtn(discord.ui.Button):
-                def __init__(self):
-                    super().__init__(
-                        style=discord.ButtonStyle.secondary,
-                        label="📖 How to read",
-                        custom_id="g_legend",
-                    )
-                async def callback(self, interaction: discord.Interaction):
-                    class LegendView(discord.ui.LayoutView):
-                        c = discord.ui.Container(
-                            discord.ui.TextDisplay(content=_legend_capture),
-                            accent_colour=config.EMBED_COLOR,
-                        )
-                    await interaction.response.send_message(
-                        view=LegendView(),
-                        ephemeral=True,
-                    )
+        # ── Build the view with buttons inside the container ─────────────────
+        # In LayoutView, interactive components (ActionRow/buttons) must be
+        # top-level class attributes or inside the Container components list.
+        # We build the button list and container comps dynamically, then
+        # create the view class with everything in place.
 
-            container = discord.ui.Container(
-                discord.ui.TextDisplay(content=heading),
-                discord.ui.TextDisplay(content=sub),
-                discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
-                discord.ui.MediaGallery(
-                    discord.MediaGalleryItem(media="attachment://graph.png"),
-                ),
-                discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
-                discord.ui.TextDisplay(content=_filters_text),
-                accent_colour=accent,
-            )
+        _btn_list: list[discord.ui.Button] = []
 
+        class _HowToReadBtn(discord.ui.Button):
             def __init__(self):
-                super().__init__(timeout=300)
+                super().__init__(
+                    style=discord.ButtonStyle.secondary,
+                    label="📖 How to read",
+                    custom_id="g_legend",
+                )
+            async def callback(self, interaction: discord.Interaction):
+                class LegendView(discord.ui.LayoutView):
+                    c = discord.ui.Container(
+                        discord.ui.TextDisplay(content=_legend_capture),
+                        accent_colour=config.EMBED_COLOR,
+                    )
+                await interaction.response.send_message(
+                    view=LegendView(),
+                    ephemeral=True,
+                )
 
-        # Dynamically add the outliers button only when there are outliers.
-        # We patch it onto the action row after class definition so the button
-        # is only present when relevant.
+        _btn_list.append(_HowToReadBtn())
+
         if _has_outliers:
-            _outlier_bytes.seek(0)  # reset for the callback closure
+            if _outlier_bytes:
+                _outlier_bytes.seek(0)
 
-            class OutliersBtn(discord.ui.Button):
+            class _OutliersBtn(discord.ui.Button):
                 def __init__(self):
                     super().__init__(
                         style=discord.ButtonStyle.danger,
@@ -640,7 +634,8 @@ class Graph(commands.Cog):
                         custom_id="g_outliers",
                     )
                 async def callback(self, interaction: discord.Interaction):
-                    _outlier_bytes.seek(0)
+                    if _outlier_bytes:
+                        _outlier_bytes.seek(0)
                     out_f = discord.File(_outlier_bytes, filename="outliers.png")
                     class OutlierView(discord.ui.LayoutView):
                         c = discord.ui.Container(
@@ -660,13 +655,28 @@ class Graph(commands.Cog):
                         ephemeral=True,
                     )
 
-            GraphView.action_row = discord.ui.ActionRow(
-                GraphView.HowToReadBtn(), OutliersBtn()
+            _btn_list.append(_OutliersBtn())
+
+        _container_comps = [
+            discord.ui.TextDisplay(content=heading),
+            discord.ui.TextDisplay(content=sub),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+            discord.ui.MediaGallery(
+                discord.MediaGalleryItem(media="attachment://graph.png"),
+            ),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay(content=_filters_text),
+            discord.ui.Separator(visible=False, spacing=discord.SeparatorSpacing.small),
+            discord.ui.ActionRow(*_btn_list),
+        ]
+
+        class GraphView(discord.ui.LayoutView):
+            container = discord.ui.Container(
+                *_container_comps,
+                accent_colour=accent,
             )
-        else:
-            GraphView.action_row = discord.ui.ActionRow(
-                GraphView.HowToReadBtn()
-            )
+            def __init__(self):
+                super().__init__(timeout=300)
 
         await ctx.send(
             view=GraphView(),
@@ -674,7 +684,6 @@ class Graph(commands.Cog):
             reference=ref,
             mention_author=False,
         )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SETUP
