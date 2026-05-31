@@ -765,7 +765,7 @@ def build_graph(
         ("Auctions", f"{total:,}",          None,     None),
         ("Std Dev",  _format_price(p_std),  None,     None),
         ("Trend",    f"{trend_arrow} {_format_price(abs(slope))}/sale", None, None),
-        ("Outliers", "All shown" if show_outliers else (f"{n_outliers} hidden" if n_outliers else "None"), None, None),
+        ("Outliers", "Include outliers" if show_outliers else (f"{n_outliers} hidden" if n_outliers else "None"), None, None),
     ]
 
     # y-coords for paired rows (two label+value pairs stacked)
@@ -800,12 +800,6 @@ def build_graph(
             axs.text(cx, S_VAL, tv, ha="center", va="center",
                      color=TEXT_COLOR, fontsize=9, fontweight="bold",
                      transform=axs.transAxes)
-
-    fig.add_artist(matplotlib.lines.Line2D(
-        [0.05, 0.95], [0.135, 0.135],
-        transform=fig.transFigure,
-        color=GRID_COLOR, linewidth=0.8,
-    ))
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=130, bbox_inches="tight",
@@ -1458,7 +1452,7 @@ class Graph(commands.Cog):
                     else:
                         # currently clean → button offers raw mode
                         _style = discord.ButtonStyle.secondary
-                        _label = "⚠️ Include Outliers too"
+                        _label = "⚠️ Show Outliers (Raw Data)"
                     super().__init__(style=_style, label=_label, custom_id="g_outliers_toggle")
                 async def callback(self, interaction: discord.Interaction):
                     await regenerate_fn(interaction, _is_alltime_cap, not _is_outliers_cap)
