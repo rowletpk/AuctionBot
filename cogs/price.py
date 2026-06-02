@@ -259,7 +259,7 @@ def _data_age_warning(records: list[dict]) -> str | None:
     if age_days > DATA_AGE_WARNING:
         return (
             f"⚠️ **Data is {age_days} days old** — market prices may have changed. "
-            f"Consider increasing `--limit` to get more recent auctions."
+            f"Consider adjusting `--limit` to get more recent auctions."
         )
     return None
 
