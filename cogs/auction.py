@@ -32,6 +32,7 @@ import config
 from config import get_gender_emoji, REPLY
 from filters import all_flags_help
 from filters import FLAG_DEFINITIONS
+from filters import is_flag, is_category_shortcut, resolve_flag
 from categories import list_categories
 from utils import (
     build_query, format_date, iv_line,
@@ -820,6 +821,41 @@ class Auction(commands.Cog):
                         return
             else:
                 i += 1
+
+        # ── Detect unknown / ambiguous flags ──────────────────────────────────
+        # Walk the tokens and report any --flag that starts with "-" but is not
+        # recognised by the filter system or as a category shortcut.
+        # This gives the user a clear error instead of silently ignoring typos.
+        _unknown_flags: list[str] = []
+        _j = 0
+        while _j < len(raw):
+            _tok = raw[_j]
+            if _tok.startswith("-"):
+                # Skip if it's a known flag or category shortcut
+                if not is_flag(_tok) and not is_category_shortcut(_tok):
+                    _unknown_flags.append(_tok)
+                # Advance past this flag AND its value token(s) if any
+                _canon = resolve_flag(_tok)
+                _info  = FLAG_DEFINITIONS.get(_canon, {}) if _canon else {}
+                _j += 1
+                if _info.get("takes_arg"):
+                    # skip value tokens (stop at next flag)
+                    while _j < len(raw) and not raw[_j].startswith("-"):
+                        _j += 1
+            else:
+                _j += 1
+
+        if _unknown_flags:
+            _uf_str = "`, `".join(_unknown_flags)
+            await ctx.send(
+                view=_error_view(
+                    f"❌ Unknown filter(s): `{_uf_str}`\n"
+                    f"{config.REPLY} Check your spelling or use `a!a h` to see all available filters."
+                ),
+                reference=ctx.message,
+                mention_author=False,
+            )
+            return
 
         # expand_name_by_dex=True: --name bulbasaur matches all Bulbasaur dex-number forms
         query, sort, limit   = build_query(raw, expand_name_by_dex=True)
