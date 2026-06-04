@@ -84,6 +84,10 @@ _DISCORD_TAG = {
 
 MAX_POINTS = 800
 
+# Hard cap on records pulled from MongoDB per query.
+# Prevents OOM when no name/filter is given and the entire collection matches.
+MAX_FETCH = 50_000
+
 # Only include auctions from this year onwards when building graphs.
 # Change this value to shift the global cutoff.
 GRAPH_START_YEAR = 2024
@@ -1067,7 +1071,6 @@ class Graph(commands.Cog):
         _GRAPH_ONLY_FLAGS = frozenset({
             FLAG_ALLTIME, FLAG_WITHOUTLIERS, FLAG_SINCE, FLAG_BEFORE, FLAG_COMPARE,
         })
-        # Also cover --evo / --sr aliases (already extracted; shouldn't be flagged)
         _EXTRACTED_FLAGS = (
             _MULTI_NAME_FLAGS_ALL
             | _SPAWNRATE_FLAGS
@@ -1100,7 +1103,7 @@ class Graph(commands.Cog):
                 if not forms_hit and not name_hit:
                     _invalid_names.append(evo_check)
 
-        # Scan raw_no_names for unknown flags (--flags that aren't recognised)
+        # Scan raw_no_names for unknown flags
         _j = 0
         while _j < len(raw_no_names):
             _tok = raw_no_names[_j]
@@ -1111,7 +1114,6 @@ class Graph(commands.Cog):
                     and _tok not in _EXTRACTED_FLAGS
                 ):
                     _unknown_flags.append(_tok)
-                # Advance past value tokens for known flags
                 _canon = resolve_flag(_tok)
                 _info  = FLAG_DEFINITIONS.get(_canon, {}) if _canon else {}
                 _j += 1
@@ -1121,7 +1123,7 @@ class Graph(commands.Cog):
             else:
                 _j += 1
 
-        # Also scan --compare names for invalid Pokémon
+        # Also validate --compare names for invalid Pokémon
         for cname in compare_names:
             check = cname.strip()
             if check:
@@ -1179,16 +1181,23 @@ class Graph(commands.Cog):
             "aid": 1, "lv":  1,
         }
 
-        def _fetch(q: dict, lim: int | None = None) -> list[dict]:
+        def _fetch(q: dict, lim: int | None = None) -> tuple[list[dict], bool]:
+            """
+            Fetch records capped at MAX_FETCH. User --limit is honoured but
+            cannot exceed MAX_FETCH. Returns (records, was_capped).
+            """
+            fetch_n = min(lim, MAX_FETCH) if lim is not None else MAX_FETCH
+            # +1 lets us detect whether more records exist beyond the cap
             cur = _col.find(
                 {**q, "ts": ts_filter, "bid": {"$exists": True}},
                 projection,
-            ).sort("ts", -1)
-            if lim is not None:
-                cur = cur.limit(lim)
+            ).sort("ts", -1).limit(fetch_n + 1)
             recs = list(cur)
+            capped = len(recs) > fetch_n
+            if capped:
+                recs = recs[:fetch_n]
             recs.sort(key=lambda r: r.get("ts", 0))
-            return recs
+            return recs, capped
 
         ref = ctx.message if not (hasattr(ctx, "interaction") and ctx.interaction) else None
 
@@ -1402,7 +1411,7 @@ class Graph(commands.Cog):
                 )
                 return
 
-            primary_records = _fetch(query)
+            primary_records, _primary_capped = _fetch(query)
             if not primary_records:
                 await ctx.send(
                     view=_error_view("❌ No auctions found for the primary Pokémon."),
@@ -1418,7 +1427,7 @@ class Graph(commands.Cog):
                 _variant_flags = [t for t in raw_no_names if t in ("--sh", "--shiny", "--gmax", "--noshiny")]
                 craw = ["--name", cname] + _variant_flags
                 cquery, _, _ = build_query(craw, expand_name_by_dex=True)
-                crecs = _fetch(cquery)
+                crecs, _ = _fetch(cquery)
                 if not crecs:
                     await ctx.send(
                         view=_error_view(f"❌ No auctions found for `{cname}` — skipping."),
@@ -1485,7 +1494,7 @@ class Graph(commands.Cog):
             for mname in multi_names:
                 mraw              = ["--name", mname] + _variant_flags
                 mquery, _, mlimit = build_query(mraw, expand_name_by_dex=True)
-                mrecs             = _fetch(mquery, mlimit)
+                mrecs, _          = _fetch(mquery, mlimit)
                 if mrecs:
                     _merged_records.extend(mrecs)
                     _found_names.append(mname.title())
@@ -1558,7 +1567,9 @@ class Graph(commands.Cog):
                 for mname in multi_names:
                     mraw2             = ["--name", mname] + _variant_flags
                     mq2, _, ml2       = build_query(mraw2, expand_name_by_dex=True)
-                    new_recs.extend(_fetch({**mq2, "ts": new_ts, "bid": {"$exists": True}}))
+                    _mr, _ = _fetch(mq2, ml2)
+                    new_recs.extend(_mr)
+                    del _mr
                 if not new_recs:
                     await interaction.followup.send("❌ No data found.", ephemeral=True)
                     return
@@ -1678,7 +1689,7 @@ class Graph(commands.Cog):
             query, _, limit = build_query(list(raw_no_names), expand_name_by_dex=True)
             _requested_name = None   # computed after fetch from actual data
 
-        records = _fetch(query, limit)
+        records, _was_capped = _fetch(query, limit)
 
         if not records:
             await ctx.send(
@@ -1737,11 +1748,12 @@ class Graph(commands.Cog):
 
         heading    = f"## {disc_tag} {name} — Price History".strip()
         limit_note = f"  •  last {limit:,} auctions" if limit is not None else ""
+        cap_badge       = f"  •  ⚠️ capped at {MAX_FETCH:,}" if _was_capped else ""
         alltime_badge   = "  •  🕐 All-time" if use_alltime else ""
         since_badge     = f"  •  📅 Since {since_dt.strftime('%b %Y')}" if since_dt else ""
         before_badge    = f"  •  📅 Before {before_dt.strftime('%b %Y')}" if before_dt else ""
         outliers_badge  = "  •  ⚠️ Raw data (all outliers included)" if use_outliers else ""
-        sub        = f"_{total:,} auction(s) plotted{limit_note}{alltime_badge}{since_badge}{before_badge}{outliers_badge}  •  filters: `{display_str}`_"
+        sub        = f"_{total:,} auction(s) plotted{limit_note}{cap_badge}{alltime_badge}{since_badge}{before_badge}{outliers_badge}  •  filters: `{display_str}`_"
 
         file = discord.File(buf, filename="graph.png")
 
@@ -1773,14 +1785,9 @@ class Graph(commands.Cog):
             await interaction.response.defer()
 
             new_ts = _build_ts_filter(new_alltime, _since_cap, _before_cap)
-            new_cursor = _col.find(
-                {**_query_cap, "ts": new_ts, "bid": {"$exists": True}},
-                projection,
-            ).sort("ts", -1)
-            if _limit_cap is not None:
-                new_cursor = new_cursor.limit(_limit_cap)
-            new_records = list(new_cursor)
-            new_records.sort(key=lambda r: r.get("ts", 0))
+            # Re-use _fetch so the MAX_FETCH cap applies on toggle too
+            _regen_q = {**_query_cap, "ts": new_ts}
+            new_records, _ = _fetch(_regen_q, _limit_cap)
 
             if not new_records:
                 await interaction.followup.send("❌ No data found.", ephemeral=True)
@@ -1891,6 +1898,13 @@ class Graph(commands.Cog):
             reference=ref,
             mention_author=False,
         )
+
+        # ── Free large objects from memory now that the response is sent ──
+        records.clear()
+        outliers.clear()
+        buf.close()
+        if out_buf is not None:
+            out_buf.close()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SETUP
