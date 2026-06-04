@@ -81,6 +81,13 @@ CATEGORIES: dict = {
             "Galarian Zen Darmanitan","Galarian Farfetch'd","Galarian Darmanitan","Galarian Zigzagoon","Galarian Rapidash","Galarian Slowpoke","Galarian Mr. Mime","Galarian Articuno","Galarian Slowking","Galarian Darumaka","Galarian Stunfisk","Galarian Slowbro","Galarian Weezing","Galarian Moltres","Galarian Corsola","Galarian Linoone","Galarian Meowth","Galarian Ponyta","Galarian Zapdos","Galarian Yamask" ,
         ],
     },
+    "starters": {
+        "name": "Starter Pokémon",
+        "aliases": ["starter", "stars"],
+        "pokemon": [
+             "Bulbasaur", "Charmander", "Chespin", "Chikorita", "Chimchar", "Cyndaquil", "Fennekin", "Froakie", "Fuecoco", "Grookey", "Litten", "Mudkip", "Oshawott", "Piplup", "Popplio", "Quaxly", "Rowlet", "Scorbunny", "Snivy", "Sobble", "Sprigatito", "Squirtle", "Tepig", "Torchic", "Totodile", "Treecko", "Turtwig",
+        ],
+    },
     "hisuian": {
         "name": "Hisuian Pokémon",
         "aliases": ["hisui", "his"],
