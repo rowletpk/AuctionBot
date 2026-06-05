@@ -1322,11 +1322,9 @@ def _build_compare_modal(col, fetch_fn) -> type[discord.ui.Modal]:
                 variant = _detect_variant(query)
                 tag     = _DISCORD_TAG.get(variant, "")
 
-                # Build a label from what the user actually typed, not from
-                # whichever Pokémon happened to sell the most in the results.
+                # Build label from the filter string, not a random winner from results.
                 _orig_tokens = slot_str.split()
 
-                # Gender suffix (♂ / ♀)
                 _gender_val, _ = _extract_flag_value_multi_alias(
                     _orig_tokens,
                     frozenset(["--gender"] + FLAG_DEFINITIONS.get("--gender", {}).get("aliases", [])),
@@ -1335,7 +1333,6 @@ def _build_compare_modal(col, fetch_fn) -> type[discord.ui.Modal]:
                     (_gender_val or "").lower(), ""
                 )
 
-                # Category, spawnrate, evo — each gives a meaningful base label
                 _cat_val, _   = _extract_flag_value_multi_alias(
                     _orig_tokens,
                     frozenset(["--category"] + FLAG_DEFINITIONS.get("--category", {}).get("aliases", [])),
@@ -1352,8 +1349,6 @@ def _build_compare_modal(col, fetch_fn) -> type[discord.ui.Modal]:
                 elif _sr_label:
                     base = f"1/{_sr_label.split('/')[-1]} rate"
                 else:
-                    # No meaningful filter to name the series — summarise unique
-                    # Pokémon in the results rather than picking one at random.
                     unique_pn = sorted({r.get("pn", "") for r in recs if r.get("pn")})
                     n = len(unique_pn)
                     if n == 1:
@@ -2632,6 +2627,42 @@ class Graph(commands.Cog):
             for _b in out_buf:
                 _b.close()
         _free_memory()  # close any lingering matplotlib figures and run GC
+
+    @commands.hybrid_command(name="compare", aliases=["gc", "cmp"])
+    @app_commands.describe(filters="Optional shared filters (can be left blank)")
+    async def compare_command(self, ctx: commands.Context, *, filters: str = ""):
+        """
+        Open the Compare modal to overlay up to 5 Pokémon price series on one graph.
+
+        Each slot in the modal accepts its own independent filter string, e.g.:
+          --n pikachu --sh
+          --cat starters --sh --g male
+          --sr 1/225
+
+        Examples:
+          a!compare
+          a!gc
+          a!cmp
+        """
+        ref = ctx.message if not (hasattr(ctx, "interaction") and ctx.interaction) else None
+        ModalCls = _build_compare_modal(self._col, None)
+        if ctx.interaction:
+            # Slash / hybrid invocation — send the modal immediately
+            await ctx.interaction.response.send_modal(ModalCls())
+        else:
+            # Prefix invocation — Discord only allows modals triggered by interactions,
+            # so send a button that opens the modal when clicked.
+            class _OpenCompareView(discord.ui.View):
+                def __init__(self_, col):
+                    super().__init__(timeout=120)
+                    self_.add_item(_CompareModalBtn(col))
+
+            await ctx.send(
+                "📊 Click below to open the Compare modal.",
+                view=_OpenCompareView(self._col),
+                reference=ref,
+                mention_author=False,
+            )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SETUP
