@@ -172,6 +172,11 @@ _SPAWNRATE_FLAGS: frozenset[str] = frozenset(
     ["--spawnrate"] + FLAG_DEFINITIONS.get("--spawnrate", {}).get("aliases", [])
 )
 
+# Evo/family flag aliases
+_EVO_FLAGS: frozenset[str] = frozenset(
+    ["--evo"] + FLAG_DEFINITIONS.get("--evo", {}).get("aliases", [])
+)
+
 # ── Graph-only flags (never passed to build_query) ────────────────────────────
 # Defined here at module level so they're shared between the command and any
 # future helpers, and not rebuilt on every invocation.
