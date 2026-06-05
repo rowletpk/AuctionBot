@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import io
+import gc
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -26,6 +27,13 @@ import pandas as pd
 from discord import app_commands
 from discord.ext import commands
 from pymongo import MongoClient
+
+try:
+    import psutil as _psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _psutil = None
+    _HAS_PSUTIL = False
 
 import config
 from config import REPLY
@@ -85,11 +93,70 @@ MAX_POINTS = 4000
 
 # Hard cap on records pulled from MongoDB per query.
 # Prevents OOM when no name/filter is given and the entire collection matches.
-MAX_FETCH = 100_000
+# Lowered from 100_000 — on a host with ~400 MB free RAM, large fetches cause
+# silent OOM kills before Python can raise MemoryError.
+MAX_FETCH = 20_000
 
 # Only include auctions from this year onwards when building graphs.
 # Change this value to shift the global cutoff.
 GRAPH_START_YEAR = 2024
+
+# ── Compare modal slots ───────────────────────────────────────────────────────
+# How many filter-string inputs appear in the "Compare" modal.
+# Each filled slot becomes one coloured line on the overlay graph.
+# Discord modals support a maximum of 5 components, so keep this ≤ 5.
+COMPARE_MODAL_SLOTS = 5
+
+# ── Memory safety ─────────────────────────────────────────────────────────────
+# If available RAM drops below this percentage, refuse to fetch/plot and free
+# matplotlib's figure cache instead.  Requires psutil (pip install psutil).
+# Set to 0 to disable the check entirely.
+MEMORY_FREE_PCT_MIN = 30   # refuse new graphs when free RAM < 30 % (~150 MB on 512 MB host)
+MEMORY_WARN_PCT     = 45   # log a warning but still proceed when free RAM < 45 %
+
+
+class _LowMemoryError(RuntimeError):
+    """Raised when the process is close to exhausting available RAM."""
+
+
+def _free_memory() -> None:
+    """
+    Best-effort memory reclamation: close all cached matplotlib figures and
+    run the garbage collector.  Called automatically when memory is low, and
+    also as a precaution after every graph is sent.
+    """
+    plt.close("all")
+    gc.collect()
+
+
+def _check_memory() -> None:
+    """
+    Raise _LowMemoryError if system free RAM is below MEMORY_FREE_PCT_MIN.
+    Logs a warning and proactively frees matplotlib figures when below MEMORY_WARN_PCT.
+    Silently skips the check when psutil is not installed or the threshold is 0.
+    """
+    if not _HAS_PSUTIL or MEMORY_FREE_PCT_MIN <= 0:
+        return
+    vm = _psutil.virtual_memory()
+    free_pct = vm.available * 100 / vm.total
+    if free_pct < MEMORY_WARN_PCT:
+        # Proactively reclaim matplotlib figure memory before it becomes critical.
+        _free_memory()
+        vm = _psutil.virtual_memory()
+        free_pct = vm.available * 100 / vm.total
+        import logging
+        logging.getLogger(__name__).warning(
+            "graph.py: low RAM — %.1f%% free (%d MB); matplotlib figures cleared",
+            free_pct, vm.available // 1024 // 1024,
+        )
+    if free_pct < MEMORY_FREE_PCT_MIN:
+        _free_memory()   # try to reclaim before giving up
+        vm2 = _psutil.virtual_memory()
+        free_pct2 = vm2.available * 100 / vm2.total
+        if free_pct2 < MEMORY_FREE_PCT_MIN:
+            raise _LowMemoryError(
+                f"Only {free_pct2:.1f}% RAM free ({vm2.available // 1024 // 1024} MB)"
+            )
 
 # ── View mode flags ────────────────────────────────────────────────────────────
 # These are parsed out of the filter string before passing to build_query.
@@ -530,8 +597,7 @@ def build_compare_graph(
         f"{names_str}  •  Price Comparison{alltime_note}{raw_note}{since_note}{before_note}",
         color=TEXT_COLOR, fontsize=13, fontweight="bold", pad=10,
     )
-    if query_str:
-        ax.set_xlabel(f"Filters: {query_str}", color=MUTED_COLOR, fontsize=8)
+    # No filter label on the graph image — shown in the Discord message subtitle instead.
 
     ax.legend(
         facecolor=BG_DARK, edgecolor=GRID_COLOR,
@@ -973,88 +1039,101 @@ def build_graph(
     return buf, list(zip(outlier_dates, outlier_prices.tolist(), outlier_records, outlier_kinds)), fetched_count, plotted_count
 
 
+OUTLIER_PAGE_SIZE = 70  # max rows per outlier table image
+
+
 def build_outlier_image(
     outliers: list[tuple],
     pokemon_name: str,
     variant: str,
-) -> io.BytesIO:
+) -> list[io.BytesIO]:
     """
-    Build a table image for outlier sales.
+    Build table image(s) for outlier sales.
     Each entry in outliers is a (date, price, record, kind) tuple.
     kind is "high" or "low". Columns: #, Type, Auction ID, Date, Level, IV%, Winning Bid
+
+    Returns a list of BytesIO — one per page of up to OUTLIER_PAGE_SIZE rows.
+    Most Pokémon have fewer than 70 outliers so this is usually a 1-element list.
     """
-    n        = len(outliers)
-    row_h_in = 0.38
-    head_h   = 0.50
-    fig_h    = head_h + n * row_h_in
-
-    fig, ax = plt.subplots(figsize=(11, fig_h), facecolor=BG_DARK)
-    ax.set_facecolor(BG_DARK)
-    ax.axis("off")
-
     headers    = ["#", "Type", "Auction ID", "Date", "Level", "IV %", "Winning Bid"]
     col_widths = [0.04, 0.08, 0.16, 0.20, 0.09, 0.12, 0.20]
 
-    rows = []
+    # Pre-build all row data with global row numbers before chunking.
+    all_rows = []
     for i, entry in enumerate(outliers):
         d, p, r, kind = entry if len(entry) == 4 else (*entry, "high")
-        aid   = str(r.get("aid", "?"))
-        date  = d.strftime("%-d %b %Y")
-        level = str(r.get("lv", "???"))
-        iv    = r.get("iv")
-        iv_s  = f"{iv:.2f}%" if iv is not None else "???"
+        aid        = str(r.get("aid", "?"))
+        date       = d.strftime("%-d %b %Y")
+        level      = str(r.get("lv", "???"))
+        iv         = r.get("iv")
+        iv_s       = f"{iv:.2f}%" if iv is not None else "???"
         kind_label = "▲ High" if kind == "high" else "▼ Low"
-        rows.append([str(i + 1), kind_label, aid, date, level, iv_s, _format_price(p)])
+        all_rows.append([str(i + 1), kind_label, aid, date, level, iv_s, _format_price(p)])
 
-    tbl = ax.table(
-        cellText=rows,
-        colLabels=headers,
-        colWidths=col_widths,
-        loc="center",
-        cellLoc="center",
-    )
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8.5)
+    # Split into pages.
+    chunks = [all_rows[i:i + OUTLIER_PAGE_SIZE]
+              for i in range(0, len(all_rows), OUTLIER_PAGE_SIZE)]
 
-    cell_h = row_h_in / fig_h
+    bufs: list[io.BytesIO] = []
+    for rows in chunks:
+        n        = len(rows)
+        row_h_in = 0.38
+        head_h   = 0.50
+        fig_h    = head_h + n * row_h_in
 
-    for (row, col), cell in tbl.get_celld().items():
-        cell.set_edgecolor(GRID_COLOR)
-        cell.set_linewidth(0.5)
-        cell.set_height(cell_h)
+        fig, ax = plt.subplots(figsize=(11, fig_h), facecolor=BG_DARK)
+        ax.set_facecolor(BG_DARK)
+        ax.axis("off")
 
-        if row == 0:
-            cell.set_facecolor(BG_DARK)
-            cell.get_text().set_color(TEXT_COLOR)
-            cell.get_text().set_fontweight("bold")
-        else:
-            cell.set_facecolor(BG_CARD if row % 2 == 0 else BG_DARK)
-            kind_val = rows[row - 1][1] if row <= len(rows) else ""
-            if col == 6:
-                # Winning bid — color by kind
-                color = "#ef476f" if "High" in kind_val else "#ffd166"
-                cell.get_text().set_color(color)
-                cell.get_text().set_fontweight("bold")
-            elif col == 1:
-                # Type column — color by high/low
-                color = "#ef476f" if "High" in kind_val else "#ffd166"
-                cell.get_text().set_color(color)
-                cell.get_text().set_fontweight("bold")
-            elif col == 5:
-                cell.get_text().set_color("#ffd166")  # IV % accent gold
-            elif col == 0:
-                cell.get_text().set_color(MUTED_COLOR)
-            elif col == 2:
-                cell.get_text().set_color(MUTED_COLOR)
-            else:
+        tbl = ax.table(
+            cellText=rows,
+            colLabels=headers,
+            colWidths=col_widths,
+            loc="center",
+            cellLoc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8.5)
+
+        cell_h = row_h_in / fig_h
+
+        for (row, col), cell in tbl.get_celld().items():
+            cell.set_edgecolor(GRID_COLOR)
+            cell.set_linewidth(0.5)
+            cell.set_height(cell_h)
+
+            if row == 0:
+                cell.set_facecolor(BG_DARK)
                 cell.get_text().set_color(TEXT_COLOR)
+                cell.get_text().set_fontweight("bold")
+            else:
+                cell.set_facecolor(BG_CARD if row % 2 == 0 else BG_DARK)
+                kind_val = rows[row - 1][1] if row <= len(rows) else ""
+                if col == 6:
+                    color = "#ef476f" if "High" in kind_val else "#ffd166"
+                    cell.get_text().set_color(color)
+                    cell.get_text().set_fontweight("bold")
+                elif col == 1:
+                    color = "#ef476f" if "High" in kind_val else "#ffd166"
+                    cell.get_text().set_color(color)
+                    cell.get_text().set_fontweight("bold")
+                elif col == 5:
+                    cell.get_text().set_color("#ffd166")  # IV % accent gold
+                elif col == 0:
+                    cell.get_text().set_color(MUTED_COLOR)
+                elif col == 2:
+                    cell.get_text().set_color(MUTED_COLOR)
+                else:
+                    cell.get_text().set_color(TEXT_COLOR)
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight",
-                facecolor=BG_DARK, edgecolor="none")
-    plt.close(fig)
-    buf.seek(0)
-    return buf
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=130, bbox_inches="tight",
+                    facecolor=BG_DARK, edgecolor="none")
+        plt.close(fig)
+        buf.seek(0)
+        bufs.append(buf)
+
+    return bufs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1092,6 +1171,404 @@ class _RegenState:
     protip_text:  str
     found_names:  list | None = None   # set for multi-name mode only
     variant_flags: list | None = None  # set for multi-name mode only
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPARE MODAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_compare_modal(col, fetch_fn) -> type[discord.ui.Modal]:
+    """
+    Factory that returns a discord.ui.Modal subclass wired to the cog's
+    MongoDB collection and async fetch helper.
+
+    Each of the COMPARE_MODAL_SLOTS text inputs accepts a full filter string
+    (e.g. ``--n meowth --sh --iv >80``).  Slots left blank are skipped.
+    Every filled slot is fetched independently and overlaid as a separate
+    coloured line on a single ``build_compare_graph`` chart.
+
+    Parameters
+    ----------
+    col:
+        The live pymongo Collection — passed in so the modal can run its own
+        queries without holding a reference to the whole cog.
+    fetch_fn:
+        The cog's ``_fetch`` coroutine (already bound to the collection).
+        Signature: ``async (query: dict, lim: int | None) -> (records, capped)``
+    """
+
+    # ── Capture col for the inner class ──────────────────────────────────────
+    # TextInput fields MUST be declared as real class-level attributes so that
+    # discord.py's Modal metaclass can walk __dict__ and register them during
+    # class creation.  Passing them via type() skips the descriptor protocol —
+    # the metaclass never sees them — causing:
+    #   ValueError: maximum number of children exceeded
+    _col_ref = col  # captured by CompareModal.on_submit below
+
+    class CompareModal(discord.ui.Modal, title="\U0001f4ca Compare Pok\u00e9mon Prices"):
+        slot_0 = discord.ui.TextInput(
+            label="Slot 1 (required)",
+            placeholder="--n meowth --sh",
+            required=True,
+            max_length=200,
+            style=discord.TextStyle.short,
+        )
+        slot_1 = discord.ui.TextInput(
+            label="Slot 2 (optional)",
+            placeholder="e.g. --n eevee --sh",
+            required=False,
+            max_length=200,
+            style=discord.TextStyle.short,
+        )
+        slot_2 = discord.ui.TextInput(
+            label="Slot 3 (optional)",
+            placeholder="e.g. --n pikachu --sh",
+            required=False,
+            max_length=200,
+            style=discord.TextStyle.short,
+        )
+        slot_3 = discord.ui.TextInput(
+            label="Slot 4 (optional)",
+            placeholder="e.g. --n garchomp --sh",
+            required=False,
+            max_length=200,
+            style=discord.TextStyle.short,
+        )
+        slot_4 = discord.ui.TextInput(
+            label="Slot 5 (optional)",
+            placeholder="e.g. --n rayquaza --sh",
+            required=False,
+            max_length=200,
+            style=discord.TextStyle.short,
+        )
+
+        async def on_submit(self, interaction: discord.Interaction):
+            await interaction.response.defer(thinking=True, ephemeral=False)
+
+            # Collect non-empty slot values in order
+            raw_slots: list[str] = []
+            for attr in ("slot_0", "slot_1", "slot_2", "slot_3", "slot_4"):
+                val = getattr(self, attr).value.strip()
+                if val:
+                    raw_slots.append(val)
+
+            if len(raw_slots) < 2:
+                await interaction.followup.send(
+                    "\u274c Please fill in at least **2 slots** to compare.", ephemeral=True
+                )
+                return
+
+            if len(raw_slots) > len(_OVERLAY_PALETTE):
+                raw_slots = raw_slots[:len(_OVERLAY_PALETTE)]
+
+            # \u2500\u2500 Parse and fetch each slot \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+            series: list[dict] = []
+            errors: list[str]  = []
+
+            for slot_str in raw_slots:
+                tokens = slot_str.split()
+
+                _slot_alltime = FLAG_ALLTIME in tokens
+                tokens = [t for t in tokens if t not in _GRAPH_ONLY_FLAGS]
+
+                _since_str, tokens = _extract_flag_value(tokens, FLAG_SINCE)
+                _before_str, tokens = _extract_flag_value(tokens, FLAG_BEFORE)
+                _since_dt  = _parse_date_flag(_since_str)  if _since_str  else None
+                _before_dt = _parse_date_flag(_before_str) if _before_str else None
+
+                _mnames, tokens = _extract_repeatable_flag_values(tokens, _MULTI_NAME_FLAGS_ALL)
+                if _mnames:
+                    tokens = ["--name", _mnames[0]] + tokens
+
+                try:
+                    query, _, limit = build_query(tokens, expand_name_by_dex=True)
+                except Exception as exc:
+                    errors.append(f"\u274c `{slot_str}` \u2014 parse error: {exc}")
+                    continue
+
+                # Always fetch all-time records from DB so the alltime toggle can
+                # filter in-memory without a second round-trip.
+                # Per-slot --since / --before are stored on the series and applied
+                # in _send_compare_result; the global GRAPH_START_YEAR cutoff is
+                # applied there too when is_alltime=False.
+                _ts_slot: dict = {"$exists": True}
+                if _since_dt:
+                    _ts_slot["$gte"] = int(_since_dt.timestamp())
+                if _before_dt:
+                    _ts_slot["$lt"] = int(_before_dt.timestamp())
+
+                try:
+                    loop = asyncio.get_running_loop()
+                    recs, _capped = await loop.run_in_executor(
+                        None,
+                        lambda q=query, lim=limit, tsf=_ts_slot: (
+                            lambda raw: (
+                                sorted(raw[:lim or MAX_FETCH], key=lambda r: r.get("ts", 0)),
+                                len(raw) > (lim or MAX_FETCH),
+                            )
+                        )(list(_col_ref.find(
+                            {**q, "ts": tsf, "bid": {"$exists": True}},
+                            {"ts": 1, "bid": 1, "pn": 1, "sh": 1, "gx": 1, "iv": 1, "aid": 1, "lv": 1},
+                        ).sort("ts", -1).limit((lim or MAX_FETCH) + 1))),
+                    )
+                except Exception as exc:
+                    errors.append(f"\u274c `{slot_str}` \u2014 fetch error: {exc}")
+                    continue
+
+                if not recs:
+                    errors.append(f"\u26a0\ufe0f `{slot_str}` \u2014 no auctions found, skipped.")
+                    continue
+
+                variant = _detect_variant(query)
+                tag     = _DISCORD_TAG.get(variant, "")
+
+                if _mnames:
+                    _label = _mnames[0].title()
+                else:
+                    from collections import Counter
+                    _pn_counts = Counter(r.get("pn", "") for r in recs if r.get("pn"))
+                    _label = _pn_counts.most_common(1)[0][0] if _pn_counts else slot_str[:30]
+
+                if tag:
+                    _label = f"{tag} {_label}"
+
+                series.append({"name": _label, "records": recs, "variant": variant,
+                               "since_dt": _since_dt, "before_dt": _before_dt})
+
+            if len(series) < 2:
+                msg = "\u274c Need at least **2 slots with data** to build a comparison graph."
+                if errors:
+                    msg += "\n" + "\n".join(errors)
+                await interaction.followup.send(msg, ephemeral=True)
+                return
+
+            # ── Helper: build and send the compare graph message ─────────────
+            # Extracted so the toggle buttons can call it without repeating code.
+            async def _send_compare_result(
+                target: discord.Interaction | None,
+                the_series: list,
+                is_alltime: bool,
+                show_outliers: bool,
+                extra_errors: list,
+                *,
+                edit: bool = False,
+            ):
+                try:
+                    _check_memory()
+                    # Apply in-memory timestamp filter so the alltime toggle works
+                    # without a DB round-trip.  Each series stores its full alltime
+                    # records; we slice down to the desired window here.
+                    _cutoff_ts = int(datetime(GRAPH_START_YEAR, 1, 1, tzinfo=timezone.utc).timestamp())
+                    filtered_series = []
+                    for s in the_series:
+                        _recs = s["records"]
+                        _s_since  = s.get("since_dt")
+                        _s_before = s.get("before_dt")
+                        _gte = None
+                        if not is_alltime:
+                            _gte = _cutoff_ts
+                        if _s_since:
+                            _s_since_ts = int(_s_since.timestamp())
+                            _gte = max(_gte, _s_since_ts) if _gte is not None else _s_since_ts
+                        _lt = int(_s_before.timestamp()) if _s_before else None
+                        _recs = [
+                            r for r in _recs
+                            if (_gte is None or r.get("ts", 0) >= _gte)
+                            and (_lt  is None or r.get("ts", 0) <  _lt)
+                        ]
+                        filtered_series.append({**s, "records": _recs})
+                    cbuf = build_compare_graph(
+                        filtered_series, "",
+                        alltime=is_alltime,
+                        show_outliers=show_outliers,
+                    )
+                except (_LowMemoryError, MemoryError):
+                    _free_memory()
+                    msg = "❌ Can't plot — low memory. Try `--limit` to reduce data."
+                    _err_target = target or interaction
+                    await _err_target.followup.send(msg, ephemeral=True)
+                    return
+                except Exception as exc:
+                    import logging, traceback
+                    logging.getLogger(__name__).error(
+                        "build_compare_graph failed: %s\n%s", exc, traceback.format_exc()
+                    )
+                    msg = f"❌ Failed to generate comparison graph: `{exc}`"
+                    _err_target = target or interaction
+                    await _err_target.followup.send(msg, ephemeral=True)
+                    return
+
+                names_heading = " vs ".join(s["name"] for s in filtered_series)
+                _at_badge  = "  •  🕐 All-time" if is_alltime else ""
+                _out_badge = "  •  ⚠️ Raw data" if show_outliers else ""
+                heading    = f"## {names_heading} — Price Comparison"
+                sub_parts  = [f"_{len(filtered_series)} series{_at_badge}{_out_badge}  •  via Compare button_"]
+                if extra_errors:
+                    sub_parts.append("\n".join(extra_errors))
+                sub = "\n".join(sub_parts)
+
+                # ── Per-series outlier images ──────────────────────────────────
+                # Collect outliers for each series so the viewer button can show them.
+                _series_outliers: list[tuple[str, bytes | None, int]] = []
+                if not show_outliers:
+                    for s in filtered_series:
+                        _recs = sorted(s["records"], key=lambda r: r.get("ts", 0))
+                        if len(_recs) > MAX_POINTS:
+                            _step = len(_recs) // MAX_POINTS
+                            _recs = _recs[::_step]
+                        _prices = np.array([r["bid"] for r in _recs], dtype=float)
+                        if len(_prices) < 2:
+                            _series_outliers.append((s["name"], None, 0))
+                            continue
+                        _q1, _q3 = np.percentile(_prices, 25), np.percentile(_prices, 75)
+                        _iqr = _q3 - _q1
+                        _upper = _q3 + 3.0 * _iqr if _iqr > 0 else _prices.max()
+                        _med   = float(np.median(_prices))
+                        _lower = max(_q1 - 3.0 * _iqr, _med * 0.20)
+                        _omask = (_prices > _upper) | ((_lower > 0) & (_prices < _lower))
+                        _orecs = [r for r, m in zip(_recs, _omask) if m]
+                        _okinds = [
+                            "high" if _prices[i] > _upper else "low"
+                            for i, m in enumerate(_omask) if m
+                        ]
+                        if _orecs:
+                            _odata = [
+                                (datetime.fromtimestamp(r.get("ts", 0), tz=timezone.utc), r.get("bid", 0), r, k)
+                                for r, k in zip(_orecs, _okinds)
+                            ]
+                            _obufs = build_outlier_image(_odata, s["name"], s.get("variant", "normal"))
+                            _series_outliers.append((s["name"], [b.getvalue() for b in _obufs], len(_orecs)))
+                        else:
+                            _series_outliers.append((s["name"], None, 0))
+                else:
+                    _series_outliers = [(s["name"], None, 0) for s in filtered_series]
+
+                _total_outliers = sum(n for _, _, n in _series_outliers)
+                _has_outliers   = _total_outliers > 0
+
+                # ── Toggle button classes ──────────────────────────────────────
+                class _CAlltimeBtn(discord.ui.Button):
+                    def __init__(self, _is_alltime, _is_outliers):
+                        if _is_alltime:
+                            super().__init__(style=discord.ButtonStyle.success,
+                                             label=f"📅 Since {GRAPH_START_YEAR} Only",
+                                             custom_id="cmp_alltime")
+                        else:
+                            super().__init__(style=discord.ButtonStyle.secondary,
+                                             label="🕐 Show All-time Data",
+                                             custom_id="cmp_alltime")
+                        self._ia = _is_alltime
+                        self._io = _is_outliers
+                    async def callback(self, intr: discord.Interaction):
+                        await intr.response.defer()
+                        await _send_compare_result(intr, the_series, not self._ia, self._io,
+                                                   extra_errors, edit=True)
+
+                class _COutliersBtn(discord.ui.Button):
+                    def __init__(self, _is_alltime, _is_outliers):
+                        if _is_outliers:
+                            super().__init__(style=discord.ButtonStyle.danger,
+                                             label="📊 Hide Outliers (Clean View)",
+                                             custom_id="cmp_outliers")
+                        else:
+                            super().__init__(style=discord.ButtonStyle.secondary,
+                                             label="⚠️ Include Outliers too",
+                                             custom_id="cmp_outliers")
+                        self._ia = _is_alltime
+                        self._io = _is_outliers
+                    async def callback(self, intr: discord.Interaction):
+                        await intr.response.defer()
+                        await _send_compare_result(intr, the_series, self._ia, not self._io,
+                                                   extra_errors, edit=True)
+
+                class _COutlierDetailBtn(discord.ui.Button):
+                    def __init__(self, _so):
+                        n = sum(c for _, _, c in _so)
+                        super().__init__(style=discord.ButtonStyle.secondary,
+                                         label=f"📋 View {n} Excluded Sale(s)",
+                                         custom_id="cmp_outlier_detail")
+                        self._so = _so
+                    async def callback(self, intr: discord.Interaction):
+                        lines = []
+                        files = []
+                        for name, ob_pages, count in self._so:
+                            if ob_pages and count > 0:
+                                n_pages = len(ob_pages)
+                                for page_idx, page_bytes in enumerate(ob_pages):
+                                    page_label = f" (part {page_idx + 1}/{n_pages})" if n_pages > 1 else ""
+                                    if page_idx == 0:
+                                        lines.append(f"**{name}** — {count} excluded sale(s){page_label}")
+                                    else:
+                                        lines.append(f"**{name}**{page_label}")
+                                    safe_name = name.replace(' ', '_')
+                                    fname = f"outliers_{safe_name}_p{page_idx + 1}.png" if n_pages > 1 else f"outliers_{safe_name}.png"
+                                    files.append(discord.File(io.BytesIO(page_bytes), filename=fname))
+                        if not files:
+                            await intr.response.send_message("❌ No outlier data.", ephemeral=True)
+                            return
+                        # Discord allows up to 10 attachments; cap to be safe
+                        files = files[:10]
+                        content_text = "📋 **Excluded sales per series:**\n" + "\n".join(lines)
+                        class _OvView(discord.ui.LayoutView):
+                            container = discord.ui.Container(
+                                discord.ui.TextDisplay(content=content_text),
+                                discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+                                *[discord.ui.MediaGallery(discord.MediaGalleryItem(
+                                    media=f"attachment://{f.filename}"
+                                )) for f in files],
+                                accent_colour=discord.Colour(0xef476f),
+                            )
+                        await intr.response.send_message(view=_OvView(), files=files, ephemeral=True)
+
+                row1_btns = [_CAlltimeBtn(is_alltime, show_outliers),
+                             _COutliersBtn(is_alltime, show_outliers)]
+                row2_btns = []
+                if _has_outliers and not show_outliers:
+                    row2_btns.append(_COutlierDetailBtn(_series_outliers))
+
+                cfile = discord.File(cbuf, filename="graph.png")
+                comps = [
+                    discord.ui.TextDisplay(content=heading),
+                    discord.ui.TextDisplay(content=sub),
+                    discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+                    discord.ui.MediaGallery(discord.MediaGalleryItem(media="attachment://graph.png")),
+                    discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+                    discord.ui.ActionRow(*row1_btns),
+                ]
+                if row2_btns:
+                    comps.append(discord.ui.ActionRow(*row2_btns))
+
+                class _CView(discord.ui.LayoutView):
+                    container = discord.ui.Container(*comps, accent_colour=config.EMBED_COLOR)
+                    def __init__(self): super().__init__(timeout=300)
+
+                if edit and target is not None:
+                    await target.edit_original_response(attachments=[cfile], view=_CView())
+                else:
+                    await interaction.followup.send(view=_CView(), file=cfile, ephemeral=False)
+
+            await _send_compare_result(None, series, False, False, errors)
+
+    return CompareModal
+
+
+class _CompareBtn(discord.ui.Button):
+    """
+    Button that opens the compare modal.  Injected into every graph's action row
+    by ``_build_btn_list``.  Holds a reference to the cog's collection so the
+    modal can run independent DB queries.
+    """
+    def __init__(self, col):
+        super().__init__(
+            style     = discord.ButtonStyle.primary,
+            label     = "📊 Compare",
+            custom_id = "g_compare_modal",
+        )
+        self._col = col
+
+    async def callback(self, interaction: discord.Interaction):
+        ModalCls = _build_compare_modal(self._col, None)
+        await interaction.response.send_modal(ModalCls())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1133,6 +1610,17 @@ class Graph(commands.Cog):
           a!g --compare mewtwo, iron valiant, brute bonnet --sh
         """
         raw = filters.split() if filters else []
+
+        # ── No-argument guard: show help instead of fetching the entire DB ────
+        # Running a!g with no filters would pull up to MAX_FETCH records for ALL
+        # Pokémon, which is extremely slow and very likely to OOM the process.
+        if not raw:
+            await ctx.send(
+                view=_error_view(_FILTERS_BODY),
+                reference=ctx.message if not (hasattr(ctx, "interaction") and ctx.interaction) else None,
+                mention_author=False,
+            )
+            return
 
         # ── Extract graph-only flags before passing to build_query ─────────────
         use_alltime    = FLAG_ALLTIME      in raw
@@ -1276,6 +1764,7 @@ class Graph(commands.Cog):
             Synchronous MongoDB fetch — always called via _fetch() so it
             never blocks the asyncio event loop directly.
             """
+            _check_memory()   # raises _LowMemoryError if RAM is critically low
             fetch_n = min(lim, MAX_FETCH) if lim is not None else MAX_FETCH
             # +1 lets us detect whether more records exist beyond the cap
             cur = _col.find(
@@ -1313,16 +1802,21 @@ class Graph(commands.Cog):
         def _build_btn_list(
             legend_text, filters_text, has_outliers, outlier_count, outlier_bytes,
             outlier_data, is_alltime, is_outliers, regenerate_fn,
+            col=None,
         ):
             """
-            Build the list of discord.ui.Button instances for the graph message.
+            Build a list of discord.ui.ActionRow instances for the graph message.
 
-            Previously used five nested classes defined inside this function, each
-            closing over different variables.  That worked but was hard to test and
-            debug.  Now each button is a small inner class that receives all its
-            state through __init__ parameters, which is how discord.py intends it.
+            Returns 1-2 ActionRows:
+              row1: always 4 buttons (HowToRead, Filters, Alltime, OutliersToggle)
+              row2: optional, contains OutlierDetail and/or Compare (only if either exists)
+
+            Each ActionRow is capped at 5 children, so splitting here avoids the
+            "maximum number of children exceeded" ValueError that fires when all 6
+            buttons are stuffed into a single ActionRow.
             """
             btn_list = []
+            optional_btns = []
 
             # ── 📖 How to Read This Graph ──────────────────────────────────────
             class _HowToReadBtn(discord.ui.Button):
@@ -1398,6 +1892,10 @@ class Graph(commands.Cog):
 
             btn_list.append(_OutliersToggleBtn(is_alltime, is_outliers, regenerate_fn))
 
+            # ── 📊 Compare button — opens the multi-slot compare modal ─────────
+            if col is not None:
+                optional_btns.append(_CompareBtn(col))
+
             # ── Outlier detail viewer ──────────────────────────────────────────
             if has_outliers and not is_outliers:
                 n_high = sum(1 for e in outlier_data if (e[3] if len(e) == 4 else "high") == "high")
@@ -1414,38 +1912,56 @@ class Graph(commands.Cog):
                             label=_label,
                             custom_id="g_outlier_detail",
                         )
-                        # Store raw bytes so the button remains usable even after
-                        # the original BytesIO is closed post-send.
-                        self._ob_bytes = _ob.getvalue() if _ob is not None else None
+                        # _ob is now a list[BytesIO]; store as list of raw bytes
+                        # so the button remains usable after the originals are closed.
+                        if _ob is None:
+                            self._ob_pages = []
+                        elif isinstance(_ob, list):
+                            self._ob_pages = [b.getvalue() for b in _ob]
+                        else:
+                            self._ob_pages = [_ob.getvalue()]  # legacy single-buf fallback
                         self._oc = _oc
                     async def callback(self, interaction: discord.Interaction):
-                        if not self._ob_bytes:
+                        if not self._ob_pages:
                             await interaction.response.send_message(
                                 "❌ Outlier image unavailable.", ephemeral=True
                             )
                             return
-                        # Reconstruct a fresh BytesIO on every click — always seekable.
-                        out_f = discord.File(io.BytesIO(self._ob_bytes), filename="outliers.png")
-                        _oc   = self._oc
+                        _oc      = self._oc
+                        n_pages  = len(self._ob_pages)
+                        files    = [
+                            discord.File(
+                                io.BytesIO(page),
+                                filename=f"outliers_p{i + 1}.png" if n_pages > 1 else "outliers.png",
+                            )
+                            for i, page in enumerate(self._ob_pages)
+                        ]
+                        page_note = f"  •  {n_pages} images" if n_pages > 1 else ""
                         class OutlierView(discord.ui.LayoutView):
                             c = discord.ui.Container(
                                 discord.ui.TextDisplay(content=(
-                                    f"📋 **{_oc} sale(s) excluded from the graph**\n"
+                                    f"📋 **{_oc} sale(s) excluded from the graph{page_note}**\n"
                                     f"_▲ Overpriced outliers inflate the average; ▼ sniped/underpriced sales compress the Y-axis. Both are hidden by default for a cleaner chart._"
                                 )),
                                 discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
-                                discord.ui.MediaGallery(
-                                    discord.MediaGalleryItem(media="attachment://outliers.png"),
-                                ),
+                                *[discord.ui.MediaGallery(
+                                    discord.MediaGalleryItem(media=f"attachment://{f.filename}"),
+                                ) for f in files],
                                 accent_colour=discord.Colour(0xef476f),
                             )
                         await interaction.response.send_message(
-                            view=OutlierView(), file=out_f, ephemeral=True,
+                            view=OutlierView(), files=files, ephemeral=True,
                         )
 
-                btn_list.append(_OutlierDetailBtn(detail_label, outlier_bytes, outlier_count))
+                optional_btns.append(_OutlierDetailBtn(detail_label, outlier_bytes, outlier_count))
 
-            return btn_list
+            # Build ActionRows: always one for the 4 core buttons, plus a second
+            # row for optional buttons (OutlierDetail, Compare) if any exist.
+            # This keeps each ActionRow within Discord's 5-child hard limit.
+            rows = [discord.ui.ActionRow(*btn_list)]
+            if optional_btns:
+                rows.append(discord.ui.ActionRow(*optional_btns))
+            return rows
 
         # ── COMPARE MODE ──────────────────────────────────────────────────────
         if compare_names:
@@ -1513,6 +2029,7 @@ class Graph(commands.Cog):
                 return
 
             try:
+                _check_memory()
                 buf = build_compare_graph(
                     series, display_str,
                     alltime=use_alltime,
@@ -1520,6 +2037,13 @@ class Graph(commands.Cog):
                     since_dt=since_dt,
                     before_dt=before_dt,
                 )
+            except (_LowMemoryError, MemoryError):
+                _free_memory()
+                await ctx.send(
+                    view=_error_view("❌ Can't plot your graph due to low memory! Try adding a `--limit` to reduce the data."),
+                    reference=ref, mention_author=False,
+                )
+                return
             except Exception as e:
                 await ctx.send(
                     view=_error_view(f"❌ Failed to generate comparison graph: `{e}`"),
@@ -1597,12 +2121,20 @@ class Graph(commands.Cog):
             _first_mquery, _, _      = build_query(_first_mraw, expand_name_by_dex=True)
 
             try:
+                _check_memory()
                 buf, outliers, _fetched_count, _plotted_count = build_graph(
                     _merged_records, _first_mquery, display_str,
                     alltime=use_alltime,
                     show_outliers=use_outliers,
                     pokemon_name=_multi_display_name,
                 )
+            except (_LowMemoryError, MemoryError):
+                _free_memory()
+                await ctx.send(
+                    view=_error_view("❌ Can't plot your graph due to low memory! Try adding a `--limit` to reduce the data."),
+                    reference=ref, mention_author=False,
+                )
+                return
             except Exception as e:
                 await ctx.send(
                     view=_error_view(f"❌ Failed to generate graph: `{e}`"),
@@ -1645,12 +2177,20 @@ class Graph(commands.Cog):
                     await interaction.followup.send("❌ No data found.", ephemeral=True)
                     return
                 try:
+                    _check_memory()
                     new_buf, new_outlier_data, _new_fetched, _new_plotted = build_graph(
                         new_recs, _first_mquery, display_str,
                         alltime=new_alltime,
                         show_outliers=new_outliers,
                         pokemon_name=_multi_display_name,
                     )
+                except (_LowMemoryError, MemoryError):
+                    _free_memory()
+                    await interaction.followup.send(
+                        "❌ Can't plot your graph due to low memory! Try adding a `--limit` to reduce the data.",
+                        ephemeral=True,
+                    )
+                    return
                 except Exception as exc:
                     await interaction.followup.send(f"❌ `{exc}`", ephemeral=True)
                     return
@@ -1669,6 +2209,7 @@ class Graph(commands.Cog):
                     is_alltime=new_alltime,
                     is_outliers=new_outliers,
                     regenerate_fn=_regenerate_graph_multi,
+                    col=_col,
                 )
                 new_container_comps = [
                     discord.ui.TextDisplay(content=heading),
@@ -1677,10 +2218,10 @@ class Graph(commands.Cog):
                     discord.ui.MediaGallery(discord.MediaGalleryItem(media="attachment://graph.png")),
                     discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
                     discord.ui.TextDisplay(content=_protip_text),
+                    discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
                 ]
                 class _NewMultiView(discord.ui.LayoutView):
-                    container  = discord.ui.Container(*new_container_comps, accent_colour=accent)
-                    action_row = discord.ui.ActionRow(*new_btn_list)
+                    container  = discord.ui.Container(*new_container_comps, *new_btn_list, accent_colour=accent)
                     def __init__(self): super().__init__(timeout=300)
                 await interaction.edit_original_response(attachments=[new_file], view=_NewMultiView())
 
@@ -1694,6 +2235,7 @@ class Graph(commands.Cog):
                 is_alltime=use_alltime,
                 is_outliers=use_outliers,
                 regenerate_fn=_regenerate_graph_multi,
+                col=_col,
             )
 
             _container_comps_multi = [
@@ -1703,11 +2245,11 @@ class Graph(commands.Cog):
                 discord.ui.MediaGallery(discord.MediaGalleryItem(media="attachment://graph.png")),
                 discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
                 discord.ui.TextDisplay(content=_protip_text),
+                discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
             ]
 
             class MultiView(discord.ui.LayoutView):
-                container  = discord.ui.Container(*_container_comps_multi, accent_colour=accent)
-                action_row = discord.ui.ActionRow(*_btn_list_multi)
+                container  = discord.ui.Container(*_container_comps_multi, *_btn_list_multi, accent_colour=accent)
                 def __init__(self): super().__init__(timeout=300)
 
             await ctx.send(view=MultiView(), file=file, reference=ref, mention_author=False)
@@ -1817,12 +2359,21 @@ class Graph(commands.Cog):
                 _requested_name = f"{n_unique} Pokémon"
 
         try:
+            _check_memory()
             buf, outliers, _fetched_count, _plotted_count = build_graph(
                 display_records, query, display_str,
                 alltime=use_alltime,
                 show_outliers=use_outliers,
                 pokemon_name=_requested_name,
             )
+        except (_LowMemoryError, MemoryError):
+            _free_memory()
+            await ctx.send(
+                view=_error_view("❌ Can't plot your graph due to low memory! Try adding a `--limit` to reduce the data."),
+                reference=ctx.message if not (hasattr(ctx, "interaction") and ctx.interaction) else None,
+                mention_author=False,
+            )
+            return
         except Exception as e:
             await ctx.send(
                 view=_error_view(f"❌ Failed to generate graph: `{e}`"),
@@ -1909,12 +2460,20 @@ class Graph(commands.Cog):
                 return
 
             try:
+                _check_memory()
                 new_buf, new_out, _new_fetched, _new_plotted = build_graph(
                     new_records, st.query, st.display_str,
                     alltime=new_alltime,
                     show_outliers=new_outliers,
                     pokemon_name=st.pokemon_name,
                 )
+            except (_LowMemoryError, MemoryError):
+                _free_memory()
+                await interaction.followup.send(
+                    "❌ Can't plot your graph due to low memory! Try adding a `--limit` to reduce the data.",
+                    ephemeral=True,
+                )
+                return
             except Exception as exc:
                 await interaction.followup.send(f"❌ Failed to regenerate: `{exc}`", ephemeral=True)
                 return
@@ -1945,6 +2504,7 @@ class Graph(commands.Cog):
                 is_alltime=new_alltime,
                 is_outliers=new_outliers,
                 regenerate_fn=_regenerate_graph,
+                col=_col,
             )
 
             new_container_comps = [
@@ -1961,9 +2521,9 @@ class Graph(commands.Cog):
             class NewGraphView(discord.ui.LayoutView):
                 container = discord.ui.Container(
                     *new_container_comps,
+                    *new_btn_list,
                     accent_colour=st.accent,
                 )
-                action_row = discord.ui.ActionRow(*new_btn_list)
                 def __init__(self):
                     super().__init__(timeout=300)
 
@@ -1983,6 +2543,7 @@ class Graph(commands.Cog):
             is_alltime=use_alltime,
             is_outliers=use_outliers,
             regenerate_fn=_regenerate_graph,
+            col=_col,
         )
 
         _container_comps = [
@@ -1994,16 +2555,15 @@ class Graph(commands.Cog):
             ),
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
             discord.ui.TextDisplay(content=_protip_text),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
         ]
-
-        _action_row = discord.ui.ActionRow(*_btn_list)
 
         class GraphView(discord.ui.LayoutView):
             container = discord.ui.Container(
                 *_container_comps,
+                *_btn_list,
                 accent_colour=accent,
             )
-            action_row = _action_row
             def __init__(self):
                 super().__init__(timeout=300)
 
@@ -2022,7 +2582,9 @@ class Graph(commands.Cog):
         outliers.clear()
         buf.close()
         if out_buf is not None:
-            out_buf.close()
+            for _b in out_buf:
+                _b.close()
+        _free_memory()  # close any lingering matplotlib figures and run GC
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SETUP
